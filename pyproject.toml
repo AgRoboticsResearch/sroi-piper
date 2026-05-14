@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "sroi_piper"
+version = "0.1.0"
+description = "SROI Piper robot control — UMI-ARX architecture"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "atomics",
+]
+
+[project.optional-dependencies]
+hardware = [
+    "piper_sdk",
+]
+inference = [
+    "torch",
+    "lerobot",
+]
+dev = [
+    "pytest",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,44 @@
+# =============================================================================
+# SROI Piper — ZMQ-based remote inference commands
+# =============================================================================
+
+# Before running: activate conda environment
+conda activate lerobot_piper_sroi
+
+# -----------------------------------------------------------------------------
+# Terminal 1: ZMQ Policy Server (GPU machine)
+# -----------------------------------------------------------------------------
+
+TRANSFORMERS_OFFLINE=1 PYTHONPATH=policy/lerobot/src:$PYTHONPATH python scripts/policy_server_zmq.py \
+    --pretrained_path policy/lerobot/outputs/sroi_piper_26050602_50k/checkpoints/010000/pretrained_model \
+    --dataset_root policy/lerobot/Datasets/sroi_piper_26050602 \
+    --host 0.0.0.0 \
+    --port 8766
+
+# -----------------------------------------------------------------------------
+# Terminal 2 (dry_run): Visualize waypoints WITHOUT moving the robot
+# -----------------------------------------------------------------------------
+# Piper motors disabled. URDF tracks live joint state in meshcat.
+# Predicted waypoints shown as colored dots (green→red).
+# Open http://127.0.0.1:7001/static/ in browser.
+
+PYTHONPATH=policy/lerobot/src:src:$PYTHONPATH python tests/viz_waypoints.py \
+    --policy_host <GPU_MACHINE_IP> \
+    --policy_port 8766 \
+    --camera_serial 230322273077 \
+    --cam_width 640 --cam_height 480 --cam_fps 30 \
+    --can_port can0 \
+    --task "pick the red strawberry" \
+    --infer_every 6
+
+# -----------------------------------------------------------------------------
+# Terminal 2 (live): Run the robot with remote inference
+# -----------------------------------------------------------------------------
+# WARNING: Motors ENABLED. Robot will move.
+
+PYTHONPATH=policy/lerobot/src:src:$PYTHONPATH python scripts/eval_piper_remote.py \
+    --policy_host <GPU_MACHINE_IP> \
+    --policy_port 8766 \
+    --cameras "{ color: {type: intelrealsense, serial_number_or_name: '230322274337', width: 640, height: 480, fps: 30} }" \
+    --can_port can0 \
+    --task "pick the red strawberry"
