@@ -146,7 +146,7 @@ def _pose6d_to_matrix(pose_6d: np.ndarray) -> np.ndarray:
 # Observation (reads from ring buffers — non-blocking)
 # ===========================================================================
 
-def get_obs(controller, cameras: dict) -> dict:
+def get_obs(controller, cameras: dict, gripper_pos: float | None = None) -> dict:
     images = {}
     t_obs = 0.0
     for name, cam in cameras.items():
@@ -155,11 +155,12 @@ def get_obs(controller, cameras: dict) -> dict:
         t_obs = float(data["timestamp"])
 
     state = controller.get_state()
+    grip = gripper_pos if gripper_pos is not None else float(state["gripper"])
     return {
         "images": images,
         "joints": state["ActualJointState"],
         "ee_pose": state["ActualEEPose"],
-        "gripper": float(state["gripper"]),
+        "gripper": grip,
         "t_obs": t_obs,
     }
 
@@ -316,51 +317,34 @@ def main():
                 args.policy_host, args.policy_port)
     zmq_sock, zmq_ctx = create_zmq_client(args.policy_host, args.policy_port)
 
-    # ── 3. Start camera subprocess (UMI pattern) ─────────────────────
-    from modules.rs_camera import RealSenseCamera
+    # ── 3. PiperEnv (camera + controller + gripper) ───────────────────
+    from modules.piper_env import PiperEnv
 
-    cam_rb = {}
-    cam_process = RealSenseCamera(
-        shm_manager=shm_manager,
-        dev_video_path=args.dev_video_path,
-        width=args.cam_width,
-        height=args.cam_height,
-        fps=args.cam_fps,
-        camera_name="color",
-    )
-    cam_process.start()
-    cam_process.start_wait()
-    cam_rb["color"] = cam_process
-    logger.info("RealSense camera subprocess started @ %d FPS", args.cam_fps)
-
-    # ── 4. Start PiperController subprocess (dry_run) ────────────────
-    from modules.piper_controller import PiperController
-
-    controller_kwargs = dict(
+    env = PiperEnv(
         shm_manager=shm_manager,
         can_port=args.can_port,
         urdf_path=args.urdf_path,
-        frequency=args.control_hz,
+        control_frequency=args.control_hz,
+        dev_video_path=args.dev_video_path,
+        camera_width=args.cam_width,
+        camera_height=args.cam_height,
+        camera_fps=args.cam_fps,
+        gripper_port=args.gripper_port,
+        gripper_kp=args.gripper_kp,
+        gripper_kd=args.gripper_kd,
         dry_run=True,
         verbose=True,
     )
-    if args.gripper_port:
-        controller_kwargs.update(
-            gripper_port=args.gripper_port,
-            gripper_kp=args.gripper_kp,
-            gripper_kd=args.gripper_kd,
-        )
-        logger.info("Gripper enabled on %s", args.gripper_port)
+    env.start()
+    controller = env.controller  # for viz access
+    camera = env.camera          # for ring buffer access
+    logger.info("PiperEnv started — motors DISABLED%s",
+                ", gripper connected" if args.gripper_port else "")
 
-    controller = PiperController(**controller_kwargs)
-    logger.info("Starting controller subprocess (dry_run=True)...")
-    controller.start(wait=True)
-    logger.info("Controller process started — motors DISABLED")
-
-    # ── 5. Init Placo meshcat ───────────────────────────────────────
+    # ── 4. Init Placo meshcat ────────────────────────────────────────
     placo_viz = init_placo_viz(args.urdf_path)
 
-    # ── 6. Main loop ────────────────────────────────────────────────
+    # ── 5. Main loop ─────────────────────────────────────────────────
     dt = 1.0 / args.fps
     frame_count = 0
     infer_count = 0
@@ -388,11 +372,12 @@ def main():
             if should_infer:
                 t_infer_start = time.perf_counter()
                 try:
-                    obs = get_obs(controller, cam_rb)
+                    obs = get_obs(controller, {"color": camera},
+                                 gripper_pos=env.gripper_position)
                     state_2step, T_base = build_state_2step(controller)
                     pred_ee = zmq_infer(zmq_sock, state_2step, obs["images"], args.task)
                     pred_world = world_from_ee_deltas(pred_ee, T_base)
-                    n_sent = controller.exec_actions(
+                    n_sent = env.exec_actions(
                         pred_world, obs_timestamps=obs["t_obs"], dt=dt,
                     )
                     infer_count += 1
@@ -411,12 +396,7 @@ def main():
             if now - last_log_time >= 1.0:
                 last_log_time = now
                 queue_n = controller.remaining()
-                grip_str = ""
-                try:
-                    grip_val = float(controller.get_state()["gripper"])
-                    grip_str = f" grip={grip_val:.2f}"
-                except Exception:
-                    pass
+                grip_str = f" grip={env.gripper_position:.2f}" if env._gripper else ""
                 try:
                     T_ee = placo_viz["robot"].get_T_world_frame("ee_link")
                     ee_pos = T_ee[:3, 3] * 1000
@@ -434,8 +414,7 @@ def main():
         logger.info("Interrupted")
     finally:
         logger.info("Shutting down...")
-        controller.stop()
-        cam_process.stop()
+        env.stop()
         shm_manager.shutdown()
         zmq_sock.close()
         zmq_ctx.term()

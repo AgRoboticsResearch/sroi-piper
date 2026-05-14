@@ -69,12 +69,6 @@ class PiperController(mp.Process):
         launch_timeout: float = 10.0,
         verbose: bool = False,
         dry_run: bool = False,
-        # Gripper (UMI pattern: same process, same queue)
-        gripper_port: str = "",
-        gripper_kp: float = 10.0,
-        gripper_kd: float = 1.0,
-        gripper_closed_rad: float = 0.734,
-        gripper_open_rad: float = -0.139,
     ):
         super().__init__(name="PiperController")
         self.can_port = can_port
@@ -91,14 +85,6 @@ class PiperController(mp.Process):
         self.launch_timeout = launch_timeout
         self.verbose = verbose
         self.dry_run = dry_run
-
-        # Gripper settings
-        self.gripper_port = gripper_port
-        self.gripper_kp = gripper_kp
-        self.gripper_kd = gripper_kd
-        self.gripper_closed_rad = gripper_closed_rad
-        self.gripper_open_rad = gripper_open_rad
-        self._gripper_range = gripper_closed_rad - gripper_open_rad  # >0
 
         # Command queue: inference → controller
         cmd_example = {
@@ -262,16 +248,6 @@ class PiperController(mp.Process):
         last_joints = iface.read_joints()
         grip_value = 1.0
 
-        # ── Gripper (UMI pattern: same process, same loop) ─────────
-        gripper = None
-        if self.gripper_port:
-            from .gripper import Gripper
-            gripper = Gripper(port=self.gripper_port)
-            gripper.connect()
-            grip_value = self._gripper_rad_to_norm(gripper.position)
-            if self.verbose:
-                logger.info("Gripper connected on %s, pos=%.3f (norm)", self.gripper_port, grip_value)
-
         # Initialize interpolator at current EE pose
         curr_pose_6d = self._joints_to_ee(kin, last_joints)
         curr_t = time.monotonic()
@@ -303,11 +279,6 @@ class PiperController(mp.Process):
 
                     if not self.dry_run:
                         iface.write_joints(joints_cmd)
-                        if gripper is not None:
-                            gripper.send_command(
-                                self.gripper_kp, self.gripper_kd,
-                                self._gripper_norm_to_rad(grip_value),
-                            )
 
                     if alpha >= 1.0:
                         joint_move_active = False
@@ -358,11 +329,6 @@ class PiperController(mp.Process):
 
                         if not self.dry_run:
                             iface.write_joints(joints_cmd)
-                            if gripper is not None:
-                                gripper.send_command(
-                                    self.gripper_kp, self.gripper_kd,
-                                    self._gripper_norm_to_rad(grip_value),
-                                )
 
                         try:
                             last_joints = iface.read_joints()
@@ -376,8 +342,6 @@ class PiperController(mp.Process):
 
                 # Step 3: update state ring buffer
                 ee_pose_6d = self._joints_to_ee(kin, last_joints)
-                if gripper is not None:
-                    grip_value = self._gripper_rad_to_norm(gripper.position)
                 try:
                     self.ring_buffer.put({
                         "ActualJointState": last_joints,
@@ -451,23 +415,8 @@ class PiperController(mp.Process):
 
         finally:
             iface.disconnect()
-            if gripper is not None:
-                try:
-                    gripper.disconnect()
-                except Exception:
-                    pass
             self.ready_event.set()
             logger.info("Controller process terminated")
-
-    # ── Gripper calibration helpers ──────────────────────────────
-
-    def _gripper_norm_to_rad(self, norm: float) -> float:
-        """Map normalized gripper (0=closed, 1=open) to radians."""
-        return self.gripper_closed_rad - norm * self._gripper_range
-
-    def _gripper_rad_to_norm(self, rad: float) -> float:
-        """Map gripper radians to normalized (0=closed, 1=open)."""
-        return (self.gripper_closed_rad - rad) / self._gripper_range
 
     @staticmethod
     def _joints_to_ee(kin, joints: np.ndarray) -> np.ndarray:
