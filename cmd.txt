@@ -25,7 +25,7 @@ TRANSFORMERS_OFFLINE=1 PYTHONPATH=policy/lerobot/src:$PYTHONPATH python scripts/
 PYTHONPATH=policy/lerobot/src:src:$PYTHONPATH python tests/viz_waypoints.py \
     --policy_host <GPU_MACHINE_IP> \
     --policy_port 8766 \
-    --camera_serial 230322273077 \
+    --dev_video_path /dev/video4 \
     --cam_width 640 --cam_height 480 --cam_fps 30 \
     --can_port can0 \
     --task "pick the red strawberry" \
