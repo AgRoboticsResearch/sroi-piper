@@ -1,9 +1,9 @@
 # =============================================================================
-# SROI Piper — ZMQ-based remote inference commands
+# SROI Piper — Run Commands
 # =============================================================================
-
-# Before running: activate conda environment
-conda activate lerobot_piper_sroi
+# Before running: conda activate lerobot_piper_sroi
+# Camera: pyrealsense2 SDK required (--camera_serial) — V4L2 produces wrong images
+# =============================================================================
 
 # -----------------------------------------------------------------------------
 # Terminal 1: ZMQ Policy Server (GPU machine)
@@ -16,29 +16,66 @@ TRANSFORMERS_OFFLINE=1 PYTHONPATH=policy/lerobot/src:$PYTHONPATH python scripts/
     --port 8766
 
 # -----------------------------------------------------------------------------
-# Terminal 2 (dry_run): Visualize waypoints WITHOUT moving the robot
+# Visualize waypoints WITHOUT moving the robot (dry_run=True)
 # -----------------------------------------------------------------------------
 # Piper motors disabled. URDF tracks live joint state in meshcat.
 # Predicted waypoints shown as colored dots (green→red).
 # Open http://127.0.0.1:7001/static/ in browser.
+# Uses spawn-based pyrealsense2 subprocess (camera isolated from main process).
 
-PYTHONPATH=policy/lerobot/src:src:$PYTHONPATH python tests/viz_waypoints.py \
-    --policy_host <GPU_MACHINE_IP> \
-    --policy_port 8766 \
-    --dev_video_path /dev/video4 \
-    --cam_width 640 --cam_height 480 --cam_fps 30 \
+PYTHONPATH=src:$PYTHONPATH python tests/viz_waypoints_rs.py \
+    --camera_serial 230322273077 \
     --can_port can0 \
-    --task "pick the red strawberry" \
+    --gripper_port /dev/ttyACM0 \
+    --infer_every 6
+
+# Local mode (no ZMQ server needed):
+PYTHONPATH=src:$PYTHONPATH python tests/viz_waypoints_rs.py \
+    --local \
+    --pretrained_path <checkpoint_path> \
+    --camera_serial 230322273077 \
+    --can_port can0 \
+    --gripper_port /dev/ttyACM0 \
     --infer_every 6
 
 # -----------------------------------------------------------------------------
-# Terminal 2 (live): Run the robot with remote inference
+# Test pyrealsense2 camera subprocess (standalone)
 # -----------------------------------------------------------------------------
-# WARNING: Motors ENABLED. Robot will move.
 
-PYTHONPATH=policy/lerobot/src:src:$PYTHONPATH python scripts/eval_piper_remote.py \
-    --policy_host <GPU_MACHINE_IP> \
-    --policy_port 8766 \
-    --cameras "{ color: {type: intelrealsense, serial_number_or_name: '230322274337', width: 640, height: 480, fps: 30} }" \
+PYTHONPATH=src:$PYTHONPATH python tests/test_rs_camera_spawn.py \
+    --camera_serial 230322273077 --duration 5
+
+# -----------------------------------------------------------------------------
+# eval_piper_remote.py — Real robot execution with keyboard control
+# -----------------------------------------------------------------------------
+# Keyboard: S=start/stop  P=pause  Q=quit
+# WARNING: Motors ENABLED unless --dry_run
+# -----------------------------------------------------------------------------
+
+# 1. Dry run first (motors disabled, meshcat viz on):
+PYTHONPATH=src:$PYTHONPATH python scripts/eval_piper_remote.py \
+    --dry_run \
+    --camera_serial 230322273077 \
     --can_port can0 \
-    --task "pick the red strawberry"
+    --gripper_port /dev/ttyACM0
+
+# 2. ZMQ remote inference (real motors):
+PYTHONPATH=src:$PYTHONPATH python scripts/eval_piper_remote.py \
+    --camera_serial 230322273077 \
+    --can_port can0 \
+    --gripper_port /dev/ttyACM0 \
+    --policy_host <GPU_MACHINE_IP> \
+    --policy_port 8766
+
+# 3. Local inference (model on robot machine):
+PYTHONPATH=src:$PYTHONPATH python scripts/eval_piper_remote.py \
+    --local \
+    --pretrained_path <checkpoint_path> \
+    --camera_serial 230322273077 \
+    --can_port can0 \
+    --gripper_port /dev/ttyACM0
+
+# 4. No gripper variant:
+PYTHONPATH=src:$PYTHONPATH python scripts/eval_piper_remote.py \
+    --camera_serial 230322273077 \
+    --can_port can0

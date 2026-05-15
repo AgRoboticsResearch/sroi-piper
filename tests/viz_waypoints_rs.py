@@ -1,32 +1,22 @@
 #!/usr/bin/env python3
-"""Visualize Piper state + SmolVLA predicted waypoints in meshcat (dry_run).
+"""Visualize Piper state + SmolVLA predicted waypoints with pyrealsense2 camera subprocess.
 
-Camera uses pyrealsense2 SDK in the main process. Controller and gripper
-run as independent mp.Processes (UMI pattern). Main loop reads everything
-non-blocking, runs inference, and visualizes waypoints.
-No motor execution — move arm and gripper by hand.
-
-Architecture:
-  pyrealsense2 (main process) ──→ color frames (direct read)
-  GripperProcess (mp.Process) ──→ SharedMemoryRingBuffer (position)
-  PiperController (mp.Process) ──→ SharedMemoryRingBuffer (joints, EE pose)
-                                   ← SharedMemoryQueue (scheduled waypoints)
-  Main process: reads camera directly + ring buffers → ZMQ/local inference → viz + schedule
+Same pipeline as viz_waypoints.py but camera uses pyrealsense2 in a spawn-based
+mp.Process (not V4L2). The spawn start method avoids inheriting USB/librealsense
+state that causes pyrealsense2 conflicts with fork.
 
 Usage:
-  # Terminal 1: start ZMQ policy server
-  python scripts/policy_server_zmq.py --pretrained_path ... --host 0.0.0.0 --port 8766
-
-  # Terminal 2: run visualization
-  python tests/viz_waypoints.py \
-      --camera_serial 230322273077 --can_port can0 --gripper_port /dev/ttyACM0
-
-  # Without gripper:
-  python tests/viz_waypoints.py --camera_serial 230322273077 --can_port can0
+  conda activate lerobot_piper_sroi && \
+  PYTHONPATH=src:$PYTHONPATH python tests/viz_waypoints_rs.py \
+      --local \
+      --pretrained_path /path/to/checkpoint \
+      --camera_serial 230322273077 \
+      --can_port can0 --gripper_port /dev/ttyACM0
 """
 
 import argparse
 import logging
+import multiprocessing as mp
 import sys
 import time
 from pathlib import Path
@@ -46,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 
 # ===========================================================================
-# Placo meshcat visualization
+# Placo meshcat visualization (same as viz_waypoints.py)
 # ===========================================================================
 
 def init_placo_viz(urdf_path: str, home_deg: np.ndarray) -> dict:
@@ -141,17 +131,30 @@ def _pose6d_to_matrix(pose_6d: np.ndarray) -> np.ndarray:
     return T
 
 
+# ===========================================================================
+# Observation helpers
+# ===========================================================================
+
+def get_obs(controller, cam_rb: dict, gripper_pos: float | None = None) -> dict:
+    images = {}
+    t_obs = 0.0
+    for name, cam in cam_rb.items():
+        data = cam.get()
+        images[name] = data["color"]
+        t_obs = float(data["timestamp"])
+
+    state = controller.get_state()
+    grip = gripper_pos if gripper_pos is not None else float(state["gripper"])
+    return {
+        "images": images,
+        "joints": state["ActualJointState"],
+        "ee_pose": state["ActualEEPose"],
+        "gripper": grip,
+        "t_obs": t_obs,
+    }
+
+
 def build_state_2step(controller, grip_pos: float | None = None):
-    """Build (2, 7) canonical UMI state in current EE frame.
-
-    Both state_curr and state_prev are expressed relative to the CURRENT
-    EE frame: state_curr is always [0,0,0, 0,0,0, grip], state_prev is
-    the previous EE pose transformed into the current EE frame.
-
-    Returns (state_2step, T_base) where T_base = T_world_ee_now.
-    Actions from policy are EE-frame deltas; convert to world via
-    T_world = T_base @ T_delta.
-    """
     from scipy.spatial.transform import Rotation
 
     try:
@@ -170,16 +173,12 @@ def build_state_2step(controller, grip_pos: float | None = None):
         grippers = states["gripper"]
         grip_prev, grip_now = float(grippers[0]), float(grippers[-1])
 
-    # Override gripper with actual position from GripperProcess if available
     if grip_pos is not None:
         grip_prev = grip_now = grip_pos
 
     T_now = _pose6d_to_matrix(ee_now)
     T_prev = _pose6d_to_matrix(ee_prev)
 
-    # Canonical UMI: both states in current EE frame
-    # state_curr = inv(T_now) @ T_now = identity → [0,0,0, 0,0,0, grip]
-    # state_prev = inv(T_now) @ T_prev → EE-frame delta from previous
     T_base = T_now
     state_prev = _pose6d_to_state(np.linalg.inv(T_base) @ T_prev, grip_prev)
     state_curr = _pose6d_to_state(np.linalg.inv(T_base) @ T_now, grip_now)
@@ -188,7 +187,6 @@ def build_state_2step(controller, grip_pos: float | None = None):
 
 
 def _pose6d_to_state(T: np.ndarray, gripper: float) -> np.ndarray:
-    """Convert 4x4 pose to 7D state [x, y, z, rx, ry, rz, gripper]."""
     from scipy.spatial.transform import Rotation
     pos = T[:3, 3]
     rotvec = Rotation.from_matrix(T[:3, :3]).as_rotvec()
@@ -333,33 +331,26 @@ def local_infer(pipeline, state_2step: np.ndarray, images: dict) -> np.ndarray:
 # ===========================================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Visualize Piper + SmolVLA waypoints (dry_run)")
-    # Robot
+    parser = argparse.ArgumentParser(description="Visualize Piper + SmolVLA waypoints (pyrealsense2)")
     parser.add_argument("--can_port", type=str, default="can0")
     parser.add_argument("--urdf_path", type=str, default=URDF_PATH)
     parser.add_argument("--control_hz", type=float, default=50.0)
-    # Gripper (DM4310 via GripperProcess — writes to ring buffer)
     parser.add_argument("--gripper_port", type=str, default="",
-                        help="Serial port for gripper (e.g. /dev/ttyACM0). Omit to skip.")
-    parser.add_argument("--gripper_kp", type=float, default=2.0,
-                        help="Gripper kp for manual mode (low = easy to move by hand)")
+                        help="Serial port for gripper (e.g. /dev/ttyACM0)")
+    parser.add_argument("--gripper_kp", type=float, default=2.0)
     parser.add_argument("--gripper_kd", type=float, default=0.5)
-    # Camera (pyrealsense2 SDK required — matches training data)
-    parser.add_argument("--camera_serial", type=str, required=True,
+    parser.add_argument("--camera_serial", type=str, default="",
                         help="RealSense serial number (e.g. 230322273077)")
     parser.add_argument("--cam_width", type=int, default=640)
     parser.add_argument("--cam_height", type=int, default=480)
     parser.add_argument("--cam_fps", type=int, default=30)
-    # Inference
     parser.add_argument("--local", action="store_true",
                         help="Load SmolVLA in-process instead of ZMQ")
-    parser.add_argument("--pretrained_path", type=str, default=None,
-                        help="Only needed for --local mode")
+    parser.add_argument("--pretrained_path", type=str, default=None)
     parser.add_argument("--dataset_root", type=str, default=None)
     parser.add_argument("--policy_host", type=str, default="localhost")
     parser.add_argument("--policy_port", type=int, default=8766)
     parser.add_argument("--device", type=str, default="cuda")
-    # Task
     parser.add_argument("--task", type=str, default=None)
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--infer_every", type=int, default=6,
@@ -375,12 +366,15 @@ def main():
     )
     args = parse_args()
 
-    # ── 1. SharedMemoryManager (all shared memory lives here) ─────────
+    # ── 0. Use spawn to avoid pyrealsense2 fork conflicts ──────────────
+    mp.set_start_method("spawn")
+
+    # ── 1. SharedMemoryManager ─────────────────────────────────────────
     from multiprocessing.managers import SharedMemoryManager
     shm_manager = SharedMemoryManager()
     shm_manager.start()
 
-    # ── 2. Setup inference backend ───────────────────────────────────
+    # ── 2. Setup inference backend ─────────────────────────────────────
     if args.local:
         if not args.pretrained_path:
             logger.error("--pretrained_path required for --local mode")
@@ -399,18 +393,24 @@ def main():
         task_prompt = args.task or "pick the red strawberry"
         pipeline = None
 
-    # ── 3. Camera setup (pyrealsense2 SDK) ───────────────────────────
-    import pyrealsense2 as rs
-    rs_pipeline = rs.pipeline()
-    rs_config = rs.config()
-    rs_config.enable_device(args.camera_serial)
-    rs_config.enable_stream(rs.stream.color, args.cam_width, args.cam_height,
-                            rs.format.rgb8, args.cam_fps)
-    rs_pipeline.start(rs_config)
-    logger.info("pyrealsense2 camera started (serial=%s, %dx%d@%d)",
-                 args.camera_serial, args.cam_width, args.cam_height, args.cam_fps)
+    # ── 3. Start pyrealsense2 camera subprocess (spawn) ────────────────
+    from modules.rs_camera_pysdk import PyRealSenseCamera
+    cam_rb = {}
+    cam_process = PyRealSenseCamera(
+        shm_manager=shm_manager,
+        serial_number=args.camera_serial,
+        width=args.cam_width,
+        height=args.cam_height,
+        fps=args.cam_fps,
+        camera_name="color",
+    )
+    cam_process.start()
+    cam_process.start_wait()
+    cam_rb["color"] = cam_process
+    logger.info("PyRealSense camera subprocess started — writing to ring buffer @ %d FPS",
+                 args.cam_fps)
 
-    # ── 4. Start GripperProcess (if port specified) ───────────────────
+    # ── 4. Start GripperProcess (if port specified) ────────────────────
     gripper = None
     if args.gripper_port:
         from modules.gripper import GripperProcess
@@ -422,12 +422,10 @@ def main():
         )
         gripper.start()
         gripper.start_wait()
-        # Send low-kp command so gripper is backdrivable (can be moved by hand)
         gripper.send_command(kp=args.gripper_kp, kd=args.gripper_kd, position=0.0)
-        logger.info("GripperProcess started — kp=%.1f (backdrivable), state in ring buffer",
-                    args.gripper_kp)
+        logger.info("GripperProcess started — kp=%.1f (backdrivable)", args.gripper_kp)
 
-    # ── 5. Start PiperController subprocess (dry_run) ─────────────────
+    # ── 5. Start PiperController subprocess (dry_run) ──────────────────
     from modules.piper_controller import PiperController
 
     controller = PiperController(
@@ -445,10 +443,10 @@ def main():
     controller.start(wait=True)
     logger.info("Controller process started — motors DISABLED")
 
-    # ── 6. Init placo visualization ─────────────────────────────────
+    # ── 6. Init placo visualization ────────────────────────────────────
     placo_viz = init_placo_viz(args.urdf_path, HOME_POSE_DEG)
 
-    # ── 7. Main loop ────────────────────────────────────────────────
+    # ── 7. Main loop ───────────────────────────────────────────────────
     dt = 1.0 / args.fps
     frame_count = 0
     infer_count = 0
@@ -479,31 +477,17 @@ def main():
                 except Exception:
                     pass
 
-            # C. Run inference periodically (UMI: skip if queue too full)
+            # C. Run inference periodically
             should_infer = (args.infer_every <= 0
                             or frame_count % args.infer_every == 0)
             if should_infer:
-                # UMI guard: skip inference when controller queue is backed up
-                # (prevents queue Full() and keeps waypoint latency low)
                 if controller.remaining() >= 30:
                     should_infer = False
 
             if should_infer:
                 t_infer_start = time.perf_counter()
                 try:
-                    # Read camera frame (pyrealsense2 direct read)
-                    frames = rs_pipeline.wait_for_frames()
-                    color_frame = frames.get_color_frame()
-                    img = np.asanyarray(color_frame.get_data())
-                    state = controller.get_state()
-                    grip = grip_pos if grip_pos is not None else float(state["gripper"])
-                    obs = {
-                        "images": {"color": img},
-                        "joints": state["ActualJointState"],
-                        "ee_pose": state["ActualEEPose"],
-                        "gripper": grip,
-                        "t_obs": time.time(),
-                    }
+                    obs = get_obs(controller, cam_rb, gripper_pos=grip_pos)
                     state_2step, T_base = build_state_2step(controller, grip_pos=grip_pos)
 
                     if args.local:
@@ -559,7 +543,7 @@ def main():
     finally:
         logger.info("Shutting down...")
         controller.stop()
-        rs_pipeline.stop()
+        cam_process.stop()
         if gripper is not None:
             gripper.stop()
         shm_manager.shutdown()
