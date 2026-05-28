@@ -359,8 +359,7 @@ def main():
         )
         gripper.start()
         gripper.start_wait()
-        gripper.send_command(kp=10.0, kd=1.0, position=0.0)
-        logger.info("Gripper started")
+        logger.info("Gripper started (holding current position)")
 
     # ── 5. Init visualization ────────────────────────────────────────────
     placo_viz = None

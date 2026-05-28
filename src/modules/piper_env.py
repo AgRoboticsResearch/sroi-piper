@@ -121,9 +121,9 @@ class PiperEnv:
         self._gripper_recv_id = gripper_recv_id
         self.gripper_kp = gripper_kp
         self.gripper_kd = gripper_kd
-        self.gripper_closed_rad = gripper_closed_rad
-        self.gripper_open_rad = gripper_open_rad
-        self._gripper_range = gripper_closed_rad - gripper_open_rad  # >0
+        self._gripper_closed_rad = gripper_closed_rad
+        self._gripper_open_rad = gripper_open_rad
+        self._gripper_range = abs(gripper_closed_rad - gripper_open_rad)
         self._gripper_frequency = gripper_frequency
 
         # ── Timing ─────────────────────────────────────────────────
@@ -135,16 +135,80 @@ class PiperEnv:
         self._last_camera_data = None
 
     # ==================================================================
-    # Gripper helpers (moved from controller)
+    # Gripper calibration
+    # ==================================================================
+
+    def calibrate_gripper(
+        self,
+        torque_threshold: float = 2.0,
+        timeout: float = 5.0,
+    ) -> float:
+        """Home gripper by closing against the mechanical stop.
+
+        Uses the synchronous Gripper API — must be called **before**
+        ``start()`` (which spawns GripperProcess).  Updates
+        ``gripper_closed_rad`` and ``gripper_open_rad`` so the
+        GripperProcess starts pre-calibrated.
+
+        Returns the measured range in radians.
+        """
+        from modules.gripper import Gripper
+
+        with Gripper(
+            self.gripper_port, self._gripper_baudrate,
+            self._gripper_can_id, self._gripper_recv_id,
+        ) as g:
+            state = g.home(
+                close_direction=1,
+                torque_threshold=torque_threshold,
+                timeout=timeout,
+            )
+
+        range_rad = abs(state.position)
+        self.gripper_closed_rad = 0.0
+        self.gripper_open_rad = -range_rad
+        self._gripper_range = range_rad
+
+        logger.info(
+            "Gripper calibrated: closed=%.3f, open=%.3f, range=%.3f rad",
+            self.gripper_closed_rad, self.gripper_open_rad, self._gripper_range,
+        )
+        return range_rad
+
+    @property
+    def is_calibrated(self) -> bool:
+        """Whether the gripper has been calibrated."""
+        if self._gripper is None:
+            return False
+        try:
+            state = self._gripper.get_state()
+            return bool(state.get("is_calibrated", 0))
+        except Exception:
+            return False
+
+    def _gripper_update_calib_from_ring(self) -> None:
+        """Pull closed/open angles from the ring buffer (called after calibration)."""
+        if self._gripper is None:
+            return
+        state = self._gripper.get_state()
+        if state.get("is_calibrated", 0):
+            self._gripper_closed_rad = float(state["closed_angle"])
+            self._gripper_open_rad = float(state["open_angle"])
+            self._gripper_range = abs(self._gripper_closed_rad - self._gripper_open_rad)
+
+    # ==================================================================
+    # Gripper helpers
     # ==================================================================
 
     def _gripper_norm_to_rad(self, norm: float) -> float:
         """Map normalized gripper (0=closed, 1=open) to radians."""
-        return self.gripper_closed_rad - norm * self._gripper_range
+        return self._gripper_closed_rad + norm * (self._gripper_open_rad - self._gripper_closed_rad)
 
     def _gripper_rad_to_norm(self, rad: float) -> float:
         """Map gripper radians to normalized (0=closed, 1=open)."""
-        return (self.gripper_closed_rad - rad) / self._gripper_range
+        if self._gripper_range <= 0:
+            return 1.0
+        return (rad - self._gripper_closed_rad) / (self._gripper_open_rad - self._gripper_closed_rad)
 
     @property
     def gripper_position(self) -> float:
@@ -177,11 +241,15 @@ class PiperEnv:
                 can_id=self._gripper_can_id,
                 recv_id=self._gripper_recv_id,
                 frequency=self._gripper_frequency,
+                position_min=self._gripper_open_rad,
+                position_max=self._gripper_closed_rad,
             )
             self._gripper.start(wait=False)
 
         if wait:
             self.start_wait()
+            if self._gripper is not None:
+                self._gripper_update_calib_from_ring()
 
     def start_wait(self):
         self.camera.start_wait()
@@ -309,10 +377,27 @@ class PiperEnv:
             )
             # Gripper: send command directly (env owns the hardware)
             if self._gripper is not None:
-                grip_target = self._gripper_norm_to_rad(float(new_actions[i, 6]))
-                self._gripper.send_command(
-                    self.gripper_kp, self.gripper_kd, grip_target,
-                )
+                grip_norm = float(new_actions[i, 6])
+                if self.is_calibrated:
+                    # Torque-mode grasping when calibrated
+                    if grip_norm < 0.3:
+                        self._gripper.send_torque(
+                            self.gripper_kd, -2.0,
+                        )
+                    elif grip_norm > 0.7:
+                        self._gripper.send_torque(
+                            self.gripper_kd, 2.0,
+                        )
+                    else:
+                        grip_target = self._gripper_norm_to_rad(grip_norm)
+                        self._gripper.send_command(
+                            self.gripper_kp, self.gripper_kd, grip_target,
+                        )
+                else:
+                    grip_target = self._gripper_norm_to_rad(grip_norm)
+                    self._gripper.send_command(
+                        self.gripper_kp, self.gripper_kd, grip_target,
+                    )
 
         return len(new_actions)
 

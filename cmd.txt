@@ -23,14 +23,14 @@ TRANSFORMERS_OFFLINE=1 PYTHONPATH=policy/lerobot/src:$PYTHONPATH python scripts/
 # Open http://127.0.0.1:7001/static/ in browser.
 # Uses spawn-based pyrealsense2 subprocess (camera isolated from main process).
 
-PYTHONPATH=src:$PYTHONPATH python tests/viz_waypoints_rs.py \
+python tests/viz_waypoints_rs.py \
     --camera_serial 230322273077 \
     --can_port can0 \
     --gripper_port /dev/ttyACM0 \
     --infer_every 6
 
 # Local mode (no ZMQ server needed):
-PYTHONPATH=src:$PYTHONPATH python tests/viz_waypoints_rs.py \
+python tests/viz_waypoints_rs.py \
     --local \
     --pretrained_path <checkpoint_path> \
     --camera_serial 230322273077 \
@@ -42,7 +42,7 @@ PYTHONPATH=src:$PYTHONPATH python tests/viz_waypoints_rs.py \
 # Test pyrealsense2 camera subprocess (standalone)
 # -----------------------------------------------------------------------------
 
-PYTHONPATH=src:$PYTHONPATH python tests/test_rs_camera_spawn.py \
+python tests/test_rs_camera_spawn.py \
     --camera_serial 230322273077 --duration 5
 
 # -----------------------------------------------------------------------------
@@ -53,22 +53,20 @@ PYTHONPATH=src:$PYTHONPATH python tests/test_rs_camera_spawn.py \
 # -----------------------------------------------------------------------------
 
 # 1. Dry run first (motors disabled, meshcat viz on):
-PYTHONPATH=src:$PYTHONPATH python scripts/eval_piper_remote.py \
+python scripts/eval_piper_remote.py \
     --dry_run \
     --camera_serial 230322273077 \
     --can_port can0 \
     --gripper_port /dev/ttyACM0
 
-# 2. ZMQ remote inference (real motors):
-PYTHONPATH=src:$PYTHONPATH python scripts/eval_piper_remote.py \
+# 2. ZMQ inference (real motors, policy server on localhost:8766):
+python scripts/eval_piper_remote.py \
     --camera_serial 230322273077 \
     --can_port can0 \
-    --gripper_port /dev/ttyACM0 \
-    --policy_host <GPU_MACHINE_IP> \
-    --policy_port 8766
+    --gripper_port /dev/ttyACM0
 
 # 3. Local inference (model on robot machine):
-PYTHONPATH=src:$PYTHONPATH python scripts/eval_piper_remote.py \
+python scripts/eval_piper_remote.py \
     --local \
     --pretrained_path <checkpoint_path> \
     --camera_serial 230322273077 \
@@ -76,6 +74,6 @@ PYTHONPATH=src:$PYTHONPATH python scripts/eval_piper_remote.py \
     --gripper_port /dev/ttyACM0
 
 # 4. No gripper variant:
-PYTHONPATH=src:$PYTHONPATH python scripts/eval_piper_remote.py \
+python scripts/eval_piper_remote.py \
     --camera_serial 230322273077 \
     --can_port can0

@@ -32,11 +32,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-URDF_PATH = str(
-    PROJECT_ROOT
-    / "third_party" / "lerobot_robot_piper" / "lerobot_robot_piper"
-    / "urdf" / "piper_description.urdf"
-)
+URDF_PATH = str(PROJECT_ROOT / "src" / "utils" / "piper_urdf" / "piper.urdf")
 ARM_JOINTS = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
 ALL_LINKS = [
     "base_link", "link1", "link2", "link3", "link4", "link5", "link6",
@@ -166,6 +162,12 @@ def get_obs(controller, cameras: dict, gripper_pos: float | None = None) -> dict
 
 
 def build_state_2step(controller):
+    """Build (2, 7) canonical UMI state in current EE frame.
+
+    Both state_curr and state_prev are expressed relative to the CURRENT
+    EE frame: state_curr is always [0,0,0, 0,0,0, grip], state_prev is
+    the previous EE pose transformed into the current EE frame.
+    """
     try:
         count = controller.ring_buffer.count
         states = controller.get_state(k=2) if count >= 2 else controller.get_state()
@@ -185,28 +187,19 @@ def build_state_2step(controller):
     T_now = _pose6d_to_matrix(ee_now)
     T_prev = _pose6d_to_matrix(ee_prev)
 
-    pos = T_now[:3, 3]
-    R = T_now[:3, :3]
-    angle = np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))
-    if angle < 1e-10:
-        rotvec = np.zeros(3)
-    else:
-        axis = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
-        rotvec = axis / (2 * np.sin(angle)) * angle
-    state_curr = np.array([*pos, *rotvec, grip_now], dtype=np.float32)
+    # Canonical UMI: both states in current EE frame
+    T_base = T_now
+    state_prev = _pose6d_to_state(np.linalg.inv(T_base) @ T_prev, grip_prev)
+    state_curr = _pose6d_to_state(np.linalg.inv(T_base) @ T_now, grip_now)
 
-    T_rel = np.linalg.inv(T_now) @ T_prev
-    pos_p = T_rel[:3, 3]
-    R_p = T_rel[:3, :3]
-    angle_p = np.arccos(np.clip((np.trace(R_p) - 1) / 2, -1, 1))
-    if angle_p < 1e-10:
-        rotvec_p = np.zeros(3)
-    else:
-        axis_p = np.array([R_p[2, 1] - R_p[1, 2], R_p[0, 2] - R_p[2, 0], R_p[1, 0] - R_p[0, 1]])
-        rotvec_p = axis_p / (2 * np.sin(angle_p)) * angle_p
-    state_prev = np.array([*pos_p, *rotvec_p, grip_prev], dtype=np.float32)
+    return np.stack([state_prev, state_curr]), T_base
 
-    return np.stack([state_prev, state_curr]), T_now
+
+def _pose6d_to_state(T: np.ndarray, gripper: float) -> np.ndarray:
+    """Convert 4x4 pose to 7D state [x, y, z, rx, ry, rz, gripper]."""
+    pos = T[:3, 3]
+    rotvec = Rotation.from_matrix(T[:3, :3]).as_rotvec()
+    return np.array([*pos, *rotvec, gripper], dtype=np.float32)
 
 
 def world_from_ee_deltas(pred_ee: np.ndarray, T_base: np.ndarray) -> np.ndarray:

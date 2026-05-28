@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Quick test: start RealSense camera subprocess, read frames from ring buffer.
 
-Verifies the pyrealsense2 → ring buffer pipeline works before integrating
+Verifies the OpenCV V4L2 → ring buffer pipeline works before integrating
 with the full viz/inference stack.
 
 Usage:
-  python tests/test_rs_camera.py --serial 230322273077
-  python tests/test_rs_camera.py --serial 230322273077 --width 1280 --height 720 --fps 15
+  conda activate lerobot_piper_sroi
+  PYTHONPATH=src:$PYTHONPATH python tests/test_rs_camera.py
+  PYTHONPATH=src:$PYTHONPATH python tests/test_rs_camera.py --dev_video_path /dev/video4
+  PYTHONPATH=src:$PYTHONPATH python tests/test_rs_camera.py --width 1280 --height 720 --fps 15
 """
 
 import argparse
@@ -26,14 +28,15 @@ def main():
     )
 
     parser = argparse.ArgumentParser(description="Test RealSense camera subprocess")
-    parser.add_argument("--serial", type=str, default="")
+    parser.add_argument("--dev_video_path", type=str, default="",
+                        help="V4L2 device path (auto-detect if empty)")
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--duration", type=float, default=5.0,
                         help="Test duration in seconds")
-    parser.add_argument("--get_k", type=int, default=1,
-                        help="Read last K frames each iteration")
+    parser.add_argument("--get_k", type=int, default=0,
+                        help="Read last K frames each iteration (0 = single frame)")
     args = parser.parse_args()
 
     from multiprocessing.managers import SharedMemoryManager
@@ -45,7 +48,7 @@ def main():
 
     cam = RealSenseCamera(
         shm_manager=shm,
-        serial_number=args.serial,
+        dev_video_path=args.dev_video_path,
         width=args.width,
         height=args.height,
         fps=args.fps,
@@ -62,28 +65,25 @@ def main():
 
     try:
         while time.monotonic() - t_start < args.duration:
-            data = cam.get(k=args.get_k)
+            if args.get_k > 0:
+                data = cam.get(k=args.get_k)
+                color = data["color"]
+                frame_count += args.get_k
+            else:
+                data = cam.get()
+                color = data["color"]
+                frame_count += 1
 
-            color = data["color"]
-            ts = float(data["timestamp"])
             step = int(data["step_idx"])
-
-            frame_count += args.get_k if args.get_k > 0 else 1
 
             now = time.monotonic()
             if now - last_log >= 1.0:
                 elapsed = now - t_start
-                fps_actual = frame_count / elapsed
-                if args.get_k > 1:
-                    logger.info(
-                        "step=%d frames=%d fps=%.1f shape=%s ts=%.3f (last %d frames)",
-                        step, frame_count, fps_actual, color.shape, ts, args.get_k,
-                    )
-                else:
-                    logger.info(
-                        "step=%d frames=%d fps=%.1f shape=%s dtype=%s ts=%.3f",
-                        step, frame_count, fps_actual, color.shape, color.dtype, ts,
-                    )
+                fps_actual = frame_count / elapsed if elapsed > 0 else 0
+                logger.info(
+                    "step=%d frames=%d fps=%.1f shape=%s dtype=%s",
+                    step, frame_count, fps_actual, color.shape, color.dtype,
+                )
                 last_log = now
 
     except KeyboardInterrupt:

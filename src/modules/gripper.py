@@ -73,6 +73,20 @@ _MOTOR_LIMITS: dict[MotorType, MotorLimits] = {
 
 
 # ===========================================================================
+# Control mode
+# ===========================================================================
+
+class ControlMode(IntEnum):
+    """Gripper control mode sent via command queue."""
+    MIT_POSITION = 0       # impedance position control (kp, kd, position)
+    TORQUE = 1             # pure torque feedforward (kp=0, kd, tau)
+    CALIBRATE_SET_CLOSED = 2  # record current position as closed limit
+    CALIBRATE_SET_OPEN = 3    # record current position as open limit
+    CALIBRATE_CONFIRM = 4  # enable position clamping
+    DISABLE = 5            # disable motor
+
+
+# ===========================================================================
 # DM CAN protocol helpers
 # ===========================================================================
 
@@ -317,6 +331,48 @@ class Gripper:
         self._send_command_and_read(CMD_SET_ZERO)
         return self._get_state()
 
+    def home(
+        self,
+        close_direction: int = 1,
+        torque_threshold: float = 2.0,
+        kp: float = 5.0,
+        kd: float = 0.5,
+        timeout: float = 5.0,
+    ) -> MotorState:
+        """Home by closing against the mechanical stop.
+
+        Drives the motor in *close_direction* until torque exceeds
+        *torque_threshold*, then zeros the encoder at that position.
+        Uses low kp/kd so the impedance controller naturally limits
+        the contact force.
+
+        Returns the state *at* the mechanical stop (before zeroing).
+        ``state.position`` is the range travelled — after homing,
+        closed = 0.0 and open = -(range).
+        """
+        target = close_direction * self._limits.p_max * 0.5
+        deadline = time.monotonic() + timeout
+        last_state = self._get_state()
+
+        while time.monotonic() < deadline:
+            last_state = self.send_command(kp, kd, target)
+            if abs(last_state.torque) > torque_threshold:
+                break
+            time.sleep(0.01)
+        else:
+            raise GripperError(
+                f"Homing timed out after {timeout}s: "
+                f"torque={abs(last_state.torque):.2f} < threshold={torque_threshold}"
+            )
+
+        pos_at_stop = last_state.position
+        self.set_zero()
+        logger.info(
+            "Gripper homed: stop at %.3f rad (now zero), range=%.3f rad",
+            pos_at_stop, abs(pos_at_stop),
+        )
+        return last_state
+
     # -- Impedance control -------------------------------------------
 
     def send_command(
@@ -380,7 +436,7 @@ class Gripper:
 
     def _get_state(self) -> MotorState:
         if self._state is None:
-            return MotorState(position=0.0, velocity=0.0, torque=0.0)
+            raise GripperError("Not connected — call connect() before reading state")
         return self._state
 
 
@@ -425,6 +481,11 @@ class GripperProcess(mp.Process):
         motor_type: MotorType = MotorType.DM4310,
         frequency: float = 50.0,
         launch_timeout: float = 10.0,
+        position_min: float | None = None,
+        position_max: float | None = None,
+        torque_limit: float = 6.0,
+        torque_grace_cycles: int = 10,
+        temp_limit: int = 80,
         verbose: bool = False,
     ):
         super().__init__(name="GripperProcess")
@@ -435,10 +496,16 @@ class GripperProcess(mp.Process):
         self._motor_type = motor_type
         self._frequency = frequency
         self._launch_timeout = launch_timeout
+        self._position_min = position_min
+        self._position_max = position_max
+        self._torque_limit = torque_limit
+        self._torque_grace_cycles = torque_grace_cycles
+        self._temp_limit = temp_limit
         self._verbose = verbose
 
         # Command queue: main process → gripper process
         cmd_example = {
+            "mode": np.int64(ControlMode.MIT_POSITION),
             "kp": np.float64(_DEFAULT_KP),
             "kd": np.float64(_DEFAULT_KD),
             "position": np.float64(_DEFAULT_POSITION),
@@ -460,6 +527,11 @@ class GripperProcess(mp.Process):
             "temp_mos": np.int64(0),
             "temp_rotor": np.int64(0),
             "status": np.int64(0),
+            "is_calibrated": np.int64(0),
+            "closed_angle": np.float64(0.0),
+            "open_angle": np.float64(0.0),
+            "mode": np.int64(ControlMode.MIT_POSITION),
+            "safety_flag": np.int64(0),
         }
         from shared_memory import SharedMemoryRingBuffer
         self._ring_buffer = SharedMemoryRingBuffer.create_from_examples(
@@ -485,9 +557,10 @@ class GripperProcess(mp.Process):
             raise TimeoutError("GripperProcess did not become ready")
 
     def stop(self, wait: bool = True):
-        # Send disable command
+        # Send disable command to subprocess
         try:
             self._cmd_queue.put({
+                "mode": np.int64(ControlMode.DISABLE),
                 "kp": np.float64(0.0),
                 "kd": np.float64(0.0),
                 "position": np.float64(0.0),
@@ -517,13 +590,71 @@ class GripperProcess(mp.Process):
         self, kp: float, kd: float, position: float,
         velocity: float = 0.0, torque: float = 0.0,
     ) -> None:
-        """Queue a command. Non-blocking — returns immediately."""
+        """Queue a MIT position command. Non-blocking.
+
+        Position clamping is enforced by the subprocess when
+        calibration is active.
+        """
         self._cmd_queue.put({
+            "mode": np.int64(ControlMode.MIT_POSITION),
             "kp": np.float64(kp),
             "kd": np.float64(kd),
             "position": np.float64(position),
             "velocity": np.float64(velocity),
             "torque": np.float64(torque),
+        })
+
+    def send_torque(
+        self, kd: float, torque: float,
+    ) -> None:
+        """Queue a torque-mode command. Non-blocking.
+
+        Motor applies *torque* (Nm) with damping *kd*.  Position
+        limits are enforced by the subprocess — the gripper stops
+        automatically at calibrated min/max.
+        """
+        self._cmd_queue.put({
+            "mode": np.int64(ControlMode.TORQUE),
+            "kp": np.float64(0.0),
+            "kd": np.float64(kd),
+            "position": np.float64(0.0),
+            "velocity": np.float64(0.0),
+            "torque": np.float64(torque),
+        })
+
+    # ========== Calibration (non-blocking) ==========
+
+    def calibrate_set_closed(self) -> None:
+        """Record current position as the closed limit."""
+        self._cmd_queue.put({
+            "mode": np.int64(ControlMode.CALIBRATE_SET_CLOSED),
+            "kp": np.float64(0.0),
+            "kd": np.float64(0.0),
+            "position": np.float64(0.0),
+            "velocity": np.float64(0.0),
+            "torque": np.float64(0.0),
+        })
+
+    def calibrate_set_open(self) -> None:
+        """Record current position as the open limit."""
+        self._cmd_queue.put({
+            "mode": np.int64(ControlMode.CALIBRATE_SET_OPEN),
+            "kp": np.float64(0.0),
+            "kd": np.float64(0.0),
+            "position": np.float64(0.0),
+            "velocity": np.float64(0.0),
+            "torque": np.float64(0.0),
+        })
+
+    def calibrate_confirm(self) -> None:
+        """Enable position clamping with recorded min/max limits."""
+        self._cmd_queue.put({
+            "mode": np.int64(ControlMode.CALIBRATE_CONFIRM),
+            "kp": np.float64(0.0),
+            "kd": np.float64(0.0),
+            "position": np.float64(0.0),
+            "velocity": np.float64(0.0),
+            "torque": np.float64(0.0),
         })
 
     # ========== State (non-blocking) ==========
@@ -566,16 +697,44 @@ class GripperProcess(mp.Process):
                 f"Motor fault: {_STATUS_NAMES.get(state.status, f'0x{state.status:X}')}"
             )
 
+        # ── Calibration state (subprocess is the authority) ────────
+        _closed_angle: float | None = None
+        _open_angle: float | None = None
+        # If constructor provided limits, start calibrated
+        if self._position_min is not None and self._position_max is not None:
+            _closed_angle = self._position_max
+            _open_angle = self._position_min
+            _clamp_lower = min(_closed_angle, _open_angle)
+            _clamp_upper = max(_closed_angle, _open_angle)
+            _is_calibrated = True
+        else:
+            _clamp_lower = None
+            _clamp_upper = None
+            _is_calibrated = False
+
+        # ── Safety state ───────────────────────────────────────────
+        _torque_violation_count = 0
+        _safety_flag = 0  # 0=OK, 1=warning, 2=fault
+
         dt = 1.0 / self._frequency
+        last_mode = ControlMode.MIT_POSITION
         last_kp = _DEFAULT_KP
         last_kd = _DEFAULT_KD
-        last_position = state.position
+        last_position = state.position  # ← hold current position, don't jump
+        last_torque = 0.0
+        last_cmd_torque = 0.0
         iter_idx = 0
         t_start = time.monotonic()
 
+        def _safety_disable(reason: str) -> None:
+            nonlocal _safety_flag
+            _safety_flag = 2
+            logger.error("SAFETY: motor disabled — %s", reason)
+            transport.send(self._can_id, encode_simple_cmd(CMD_DISABLE))
+
         try:
             while True:
-                # Step 1: read latest command (non-blocking drain)
+                # ── Step 1: drain command queue ────────────────
                 from queue import Empty
                 cmd = None
                 try:
@@ -585,20 +744,88 @@ class GripperProcess(mp.Process):
                     pass
 
                 if cmd is not None:
-                    last_kp = float(cmd["kp"])
-                    last_kd = float(cmd["kd"])
-                    last_position = float(cmd["position"])
+                    cmd_mode = ControlMode(int(cmd["mode"]))
+                    cmd_kp = float(cmd["kp"])
+                    cmd_kd = float(cmd["kd"])
+                    cmd_position = float(cmd["position"])
+                    cmd_torque = float(cmd["torque"])
 
-                # Step 2: send MIT command
+                    # Calibration commands
+                    if cmd_mode == ControlMode.CALIBRATE_SET_CLOSED:
+                        _closed_angle = state.position
+                        if self._verbose:
+                            logger.info("Calibrate: closed_angle = %.3f rad", _closed_angle)
+                    elif cmd_mode == ControlMode.CALIBRATE_SET_OPEN:
+                        _open_angle = state.position
+                        if self._verbose:
+                            logger.info("Calibrate: open_angle = %.3f rad", _open_angle)
+                    elif cmd_mode == ControlMode.CALIBRATE_CONFIRM:
+                        if _closed_angle is not None and _open_angle is not None:
+                            if _closed_angle == _open_angle:
+                                logger.error(
+                                    "Calibration failed: closed_angle == open_angle == %.3f",
+                                    _closed_angle,
+                                )
+                            else:
+                                _clamp_lower = min(_closed_angle, _open_angle)
+                                _clamp_upper = max(_closed_angle, _open_angle)
+                                _is_calibrated = True
+                                logger.info(
+                                    "Calibration confirmed: closed=%.3f, open=%.3f, "
+                                    "clamp_range=[%.3f, %.3f] rad",
+                                    _closed_angle, _open_angle,
+                                    _clamp_lower, _clamp_upper,
+                                )
+                    elif cmd_mode == ControlMode.DISABLE:
+                        transport.send(self._can_id, encode_simple_cmd(CMD_DISABLE))
+                        if self._verbose:
+                            logger.info("GripperProcess disabled via command")
+                        break
+                    else:
+                        # Normal control modes — update target
+                        last_mode = cmd_mode
+                        last_kp = cmd_kp
+                        last_kd = cmd_kd
+                        last_position = cmd_position
+                        last_cmd_torque = cmd_torque
+
+                # ── Step 2: enforce position limits ─────────────
+                if _is_calibrated and last_mode == ControlMode.MIT_POSITION:
+                    last_position = max(_clamp_lower, min(_clamp_upper, last_position))
+
+                # ── Step 3: build MIT command ───────────────────
+                if last_mode == ControlMode.TORQUE:
+                    # Pure torque mode: kp=0, drive with feedforward torque
+                    kp_out = 0.0
+                    pos_out = 0.0
+                    tau_out = last_cmd_torque
+                    # Auto-stop at calibrated limits
+                    if _is_calibrated:
+                        # Closing torque → stop at closed_angle
+                        if tau_out < 0 and state.position <= _closed_angle:
+                            last_mode = ControlMode.MIT_POSITION
+                            last_kp = _DEFAULT_KP
+                            last_position = state.position
+                            last_cmd_torque = 0.0
+                        # Opening torque → stop at open_angle
+                        elif tau_out > 0 and state.position >= _open_angle:
+                            last_mode = ControlMode.MIT_POSITION
+                            last_kp = _DEFAULT_KP
+                            last_position = state.position
+                            last_cmd_torque = 0.0
+                else:
+                    kp_out = last_kp
+                    pos_out = last_position
+                    tau_out = last_torque
+
                 data = encode_mit_cmd(
-                    last_kp, last_kd, last_position,
-                    float(cmd["velocity"]) if cmd else 0.0,
-                    float(cmd["torque"]) if cmd else 0.0,
+                    kp_out, last_kd, pos_out,
+                    0.0, tau_out,
                     limits,
                 )
                 transport.send(self._can_id, data)
 
-                # Step 3: read response
+                # ── Step 4: read response ───────────────────────
                 resp = self._recv_response(transport, self._recv_id, timeout=0.005)
                 if resp is not None:
                     _can_id, resp_data = resp
@@ -608,7 +835,39 @@ class GripperProcess(mp.Process):
                             f"Motor fault: {_STATUS_NAMES.get(state.status, f'0x{state.status:X}')}"
                         )
 
-                # Step 4: write state to ring buffer
+                # ── Step 5: torque watchdog ─────────────────────
+                # Suppressed in TORQUE mode and before calibration
+                watchdog_active = (
+                    _is_calibrated
+                    and last_mode != ControlMode.TORQUE
+                    and last_mode not in (
+                        ControlMode.CALIBRATE_SET_CLOSED,
+                        ControlMode.CALIBRATE_SET_OPEN,
+                        ControlMode.CALIBRATE_CONFIRM,
+                    )
+                )
+                if watchdog_active and abs(state.torque) > self._torque_limit:
+                    _torque_violation_count += 1
+                    if _torque_violation_count == 1:
+                        _safety_flag = max(_safety_flag, 1)
+                    if _torque_violation_count > self._torque_grace_cycles:
+                        _safety_disable(
+                            f"torque={state.torque:.2f} Nm > "
+                            f"limit={self._torque_limit} Nm for "
+                            f"{_torque_violation_count} cycles"
+                        )
+                        break
+                else:
+                    _torque_violation_count = max(0, _torque_violation_count - 1)
+
+                # ── Step 6: temperature watchdog ────────────────
+                if state.temp_mos > self._temp_limit:
+                    _safety_disable(
+                        f"MOS temp={state.temp_mos}C > limit={self._temp_limit}C"
+                    )
+                    break
+
+                # ── Step 7: write state to ring buffer ──────────
                 try:
                     self._ring_buffer.put({
                         "position": np.float64(state.position),
@@ -617,6 +876,11 @@ class GripperProcess(mp.Process):
                         "temp_mos": np.int64(state.temp_mos),
                         "temp_rotor": np.int64(state.temp_rotor),
                         "status": np.int64(state.status),
+                        "is_calibrated": np.int64(1 if _is_calibrated else 0),
+                        "closed_angle": np.float64(_closed_angle if _closed_angle is not None else 0.0),
+                        "open_angle": np.float64(_open_angle if _open_angle is not None else 0.0),
+                        "mode": np.int64(last_mode),
+                        "safety_flag": np.int64(_safety_flag),
                     }, wait=False)
                 except TimeoutError:
                     pass
@@ -627,7 +891,7 @@ class GripperProcess(mp.Process):
                         logger.info("GripperProcess ready on %s, pos=%.3f rad",
                                     self._port, state.position)
 
-                # Step 5: regulate frequency
+                # ── Step 8: regulate frequency ──────────────────
                 t_wait = t_start + (iter_idx + 1) * dt
                 now = time.monotonic()
                 if t_wait > now:

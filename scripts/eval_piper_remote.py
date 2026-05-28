@@ -438,9 +438,7 @@ def main():
         )
         gripper.start()
         gripper.start_wait()
-        gripper.send_command(kp=args.gripper_kp, kd=args.gripper_kd, position=0.0)
-        logger.info("GripperProcess started — kp=%.1f, position=0.0 (open)",
-                    args.gripper_kp)
+        logger.info("GripperProcess started (holding current position)")
 
     # ── 5. PiperController subprocess ─────────────────────────────────
     from modules.piper_controller import PiperController
@@ -463,7 +461,7 @@ def main():
 
     # ── 6. Move to home ───────────────────────────────────────────────
     logger.info("Moving to home pose...")
-    controller.move_to_joints(HOME_POSE_DEG, duration=3.0, gripper=1.0)
+    controller.move_to_joints(HOME_POSE_DEG, duration=3.0, gripper=0.0)
     time.sleep(3.5)
     logger.info("Home pose reached")
 

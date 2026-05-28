@@ -18,11 +18,7 @@ from pathlib import Path
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-URDF_PATH = str(
-    PROJECT_ROOT
-    / "third_party" / "lerobot_robot_piper" / "lerobot_robot_piper"
-    / "urdf" / "piper_description.urdf"
-)
+URDF_PATH = str(PROJECT_ROOT / "src" / "utils" / "piper_urdf" / "piper.urdf")
 
 SAFE_HOME_DEG = np.array([0.0, 50.60, -50.40, -1.21, 10.00, 0.0])
 
