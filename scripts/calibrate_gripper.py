@@ -2,12 +2,13 @@
 """Calibrate SROI gripper open/close limits.
 
 Reads current position with zero force (kp=0), prompts user to
-manually move gripper to closed and open positions, then saves
-the calibration values.
+manually move gripper to closed and open positions, then auto-updates
+calibration values in all pipeline files.
 
-Output format matches piper_env.py defaults:
-    gripper_closed_rad: float = X.XXX
-    gripper_open_rad:  float = X.XXX
+Files updated:
+  - src/modules/piper_env.py
+  - scripts/test_gripper_slow_cycle.py
+  - scripts/test_gripper_slow_cycle_mp.py
 
 Usage:
   python scripts/calibrate_gripper.py
@@ -15,9 +16,37 @@ Usage:
 """
 
 import argparse
+import re
 import time
+from pathlib import Path
 
 from modules.gripper import Gripper
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+FILES_TO_UPDATE = {
+    "piper_env.py": (
+        PROJECT_ROOT / "src" / "modules" / "piper_env.py",
+        [
+            (r"gripper_closed_rad: float = [+-]?\d+\.\d+", f"gripper_closed_rad: float = {{closed}}"),
+            (r"gripper_open_rad: float = [+-]?\d+\.\d+", f"gripper_open_rad: float = {{open}}"),
+        ],
+    ),
+    "test_gripper_slow_cycle.py": (
+        PROJECT_ROOT / "scripts" / "test_gripper_slow_cycle.py",
+        [
+            (r"CLOSED_RAD = [+-]?\d+\.\d+", "CLOSED_RAD = {closed}"),
+            (r"OPEN_RAD = [+-]?\d+\.\d+", "OPEN_RAD = {open}"),
+        ],
+    ),
+    "test_gripper_slow_cycle_mp.py": (
+        PROJECT_ROOT / "scripts" / "test_gripper_slow_cycle_mp.py",
+        [
+            (r"CLOSED_RAD = [+-]?\d+\.\d+", "CLOSED_RAD = {closed}"),
+            (r"OPEN_RAD = [+-]?\d+\.\d+", "OPEN_RAD = {open}"),
+        ],
+    ),
+}
 
 
 def read_stable(g: Gripper, samples: int = 10, hz: float = 10.0) -> float:
@@ -29,6 +58,21 @@ def read_stable(g: Gripper, samples: int = 10, hz: float = 10.0) -> float:
         positions.append(state.position)
         time.sleep(dt)
     return sum(positions) / len(positions)
+
+
+def update_files(closed: float, opened: float) -> list[str]:
+    """Update calibration values in all pipeline files. Returns list of updated files."""
+    updated = []
+    for label, (path, patterns) in FILES_TO_UPDATE.items():
+        if not path.exists():
+            print(f"  SKIP {label} (not found)")
+            continue
+        text = path.read_text()
+        for pattern, replacement in patterns:
+            text = re.sub(pattern, replacement.format(closed=f"{closed:.3f}", open=f"{opened:.3f}"), text)
+        path.write_text(text)
+        updated.append(label)
+    return updated
 
 
 def main():
@@ -53,19 +97,20 @@ def main():
         opened = read_stable(g)
         print(f"  Open position: {opened:+.4f} rad\n")
 
-        # Results
-        sweep = abs(closed - opened)
-        print("=" * 40)
-        print(f"  Closed: {closed:+.4f} rad")
-        print(f"  Open:   {opened:+.4f} rad")
-        print(f"  Range:  {sweep:.4f} rad ({sweep * 180 / 3.14159:.1f} deg)")
-        print("=" * 40)
-        print("\nUpdate piper_env.py defaults:")
-        print(f"    gripper_closed_rad: float = {closed:.3f}")
-        print(f"    gripper_open_rad:  float = {opened:.3f}")
-        print("\nAlso update scripts/test_gripper_slow_cycle.py:")
-        print(f"    CLOSED_RAD = {closed:.3f}")
-        print(f"    OPEN_RAD = {opened:.3f}")
+    # Results
+    sweep = abs(closed - opened)
+    print("=" * 40)
+    print(f"  Closed: {closed:+.4f} rad")
+    print(f"  Open:   {opened:+.4f} rad")
+    print(f"  Range:  {sweep:.4f} rad ({sweep * 180 / 3.14159:.1f} deg)")
+    print("=" * 40)
+
+    # Auto-update files
+    print("\nUpdating calibration in:")
+    updated = update_files(closed, opened)
+    for f in updated:
+        print(f"  UPDATED {f}")
+    print("\nDone")
 
 
 if __name__ == "__main__":
