@@ -30,20 +30,21 @@ src/
 ## 🚀 Quick Start
 
 ```bash
-# 1. Install dependencies
-pip install numpy scipy pyserial zmq placo placo-utils
+# 1. Activate conda environment
+conda activate lerobot_piper_sroi
 
-# 2. Arm only (optional, for real hardware)
-pip install piper_sdk
+# 2. Gripper — calibrate, then test (needs hardware)
+python scripts/calibrate_gripper.py
+python scripts/test_gripper_slow_cycle.py
 
-# 3. Test gripper open/close
-python tests/test_gripper.py --port /dev/ttyACM0 --cycles 5
+# 3. Gripper — read state (no movement, safe)
+python scripts/read_gripper_state.py
 
-# 4. Read arm state (motors disabled, safe!)
+# 4. Arm — read state (motors disabled, safe!)
 python tests/test_piper_state.py --can_port can0
 
-# 5. Move arm to home pose (motors enabled ⚠️)
-python tests/test_piper_move.py --can_port can0
+# 5. Arm — go home then zero (motors enabled ⚠️, holds until Ctrl-C)
+python scripts/piper_go_home_zero.py --can_port can0
 
 # 6. Full pipeline dry-run (arm disabled, visualizes waypoints)
 #    Start policy server first:
@@ -52,11 +53,53 @@ python scripts/policy_server_zmq.py --pretrained_path ./checkpoint --port 8766
 python tests/test_full_pipeline.py --dev_video_path /dev/video4 --can_port can0
 ```
 
+## 🦾 Arm Scripts
+
+| Script | What it does | Motors |
+|---|---|---|
+| `scripts/piper_go_home_zero.py` | Home pose → zero pose, then hold | Enabled ⚠️ |
+
+## 🤏 Gripper Scripts
+
+| Script | What it does | Moves? |
+|---|---|---|
+| `scripts/calibrate_gripper.py` | Interactive calibration: set closed/open limits | No (kp=0) |
+| `scripts/read_gripper_state.py` | Live state monitor (pos, vel, torque, temp) | No (kp=0) |
+| `scripts/test_gripper_slow_cycle.py` | Slow open/close sweep with calibrated range | Yes |
+
+### Calibration workflow
+
+```bash
+# 1. Calibrate — manually hold closed/open, script records positions
+python scripts/calibrate_gripper.py
+
+# 2. Update defaults in code with the printed values:
+#    src/modules/piper_env.py  → gripper_closed_rad, gripper_open_rad
+#    scripts/test_gripper_slow_cycle.py → CLOSED_RAD, OPEN_RAD
+
+# 3. Test the calibrated range
+python scripts/test_gripper_slow_cycle.py          # 2 cycles at 0.05 rad/s
+python scripts/test_gripper_slow_cycle.py --speed 0.15  # faster
+```
+
 ## 🧪 Tests
+
+```bash
+# Unit tests (no hardware needed)
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest tests/test_gripper_unit.py -v -p anyio
+
+# Hardware tests (need gripper on /dev/ttyACM0)
+python tests/test_gripper.py --port /dev/ttyACM0 --calibrate auto --cycles 10
+python tests/test_gripper_process_smoke.py --port /dev/ttyACM0 --calibrate
+python tests/test_gripper_ringbuffer.py --port /dev/ttyACM0
+```
 
 | Test | What it does | Motors |
 |---|---|---|
-| `test_gripper.py` | Open/close gripper cycles | Enabled |
+| `test_gripper_unit.py` | Protocol encoding, calibration logic, safety (mocked) | No |
+| `test_gripper.py` | Open/close characterization with metrics | Enabled |
+| `test_gripper_process_smoke.py` | GripperProcess startup + calibration | Enabled |
+| `test_gripper_ringbuffer.py` | GripperProcess ring buffer + queue | Enabled |
 | `test_piper_state.py` | Read joint states from ring buffer | Disabled ✅ |
 | `test_piper_move.py` | Move arm to home pose | Enabled ⚠️ |
 | `test_full_pipeline.py` | Camera + controller + ZMQ + Placo viz + gripper | Disabled ✅ |
@@ -73,15 +116,14 @@ python scripts/eval_piper_remote.py --policy_host <server_ip> --policy_port 8766
 
 ## 🤏 Gripper
 
-DM4310 motor via DAMIAO DM-FDCAN USB-CAN serial bridge. Two modes:
+DM4310 motor via DAMIAO DM-FDCAN USB-CAN serial bridge. Two APIs:
 
-- **`Gripper`** — synchronous serial (standalone testing)
+- **`Gripper`** — synchronous serial (standalone testing, scripts above)
 - **`GripperProcess(mp.Process)`** — non-blocking shared memory (env integration)
 
 ```python
 from modules.gripper import Gripper
 with Gripper("/dev/ttyACM0") as g:
-    g.set_zero()
     g.send_command(kp=10.0, kd=1.0, position=0.0)
 ```
 

@@ -67,8 +67,8 @@ class PiperEnv:
         gripper_recv_id: int = 0x18,
         gripper_kp: float = 10.0,
         gripper_kd: float = 1.0,
-        gripper_closed_rad: float = 0.734,
-        gripper_open_rad: float = -0.139,
+        gripper_closed_rad: float = 0.450,
+        gripper_open_rad: float = -0.158,
         gripper_frequency: float = 50.0,
         # Observation
         camera_obs_latency: float = 0.125,

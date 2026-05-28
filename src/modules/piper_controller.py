@@ -74,7 +74,7 @@ class PiperController(mp.Process):
         self.can_port = can_port
         self.urdf_path = urdf_path
         self.target_frame = target_frame
-        self.joint_names = joint_names or [f"joint_{i+1}" for i in range(6)]
+        self.joint_names = joint_names or [f"joint{i+1}" for i in range(6)]
         self.joint_signs = np.array(joint_signs or [1, 1, 1, 1, 1, 1])
         self.frequency = frequency
         self.max_vel_deg_s = max_vel_deg_s

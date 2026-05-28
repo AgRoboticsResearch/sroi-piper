@@ -108,7 +108,9 @@ def main():
         logger.info("Final joints: %s deg", np.round(final_state["ActualJointState"], 1))
         logger.info("Final EE pose: %s", np.round(final_state["ActualEEPose"], 3))
 
-        logger.info("Movement test complete.")
+        logger.info("Movement test complete. Holding position. Press Ctrl-C to release.")
+        while True:
+            time.sleep(1.0)
 
     except KeyboardInterrupt:
         logger.info("Interrupted — disabling motors")

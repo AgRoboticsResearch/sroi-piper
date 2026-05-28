@@ -27,3 +27,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+# ROS launch_testing plugins conflict with standard pytest.
+# Run tests with:  PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -p anyio
