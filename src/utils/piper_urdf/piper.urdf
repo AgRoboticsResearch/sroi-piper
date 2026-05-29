@@ -179,8 +179,15 @@
     <!-- SROI Gripper: camera_link -->
     <link name="camera_link"/>
     <joint name="camera_joint" type="fixed">
-        <origin xyz="-0.072333 0.00895 0.058471" rpy="-0.640492 0 -1.570797"/>
+        <origin xyz="-0.072333 0.00895 0.058471" rpy="0 -0.9303043 0"/>
         <parent link="link6"/>
         <child link="camera_link"/>
+    </joint>
+    <!-- SROI Gripper: camera_optical_link -->
+    <link name="camera_optical_link"/>
+    <joint name="camera_optical_joint" type="fixed">
+        <origin xyz="0 0 0" rpy="-1.5707963 0 -1.5707963"/>
+        <parent link="camera_link"/>
+        <child link="camera_optical_link"/>
     </joint>
 </robot>
